@@ -1,0 +1,16 @@
+name: Auto PR
+
+on:
+  push:
+    branches:
+      - feat/*
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request
