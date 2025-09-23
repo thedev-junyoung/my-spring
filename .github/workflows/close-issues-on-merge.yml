@@ -1,0 +1,54 @@
+name: Close issues on merge to main (no body needed)
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: write
+
+jobs:
+  close-issues:
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect issue numbers from PR title and branch
+        id: collect
+        run: |
+          TITLE="${{ github.event.pull_request.title }}"
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          # PR 제목에서 (#123) 패턴 추출
+          TITLE_ISSUES=$(printf "%s" "$TITLE"  | grep -oE '\(#([0-9]+)\)' | grep -oE '[0-9]+' | tr '\n' ' ' | xargs -n1 || true)
+          # 브랜치명에서 숫자 하나 추출 (feat/123-...)
+          BRANCH_ISSUE=$(echo "$BRANCH" | grep -oE '[0-9]+' | head -1 || true)
+
+          ALL=$(printf "%s\n%s\n" "$TITLE_ISSUES" "$BRANCH_ISSUE" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | uniq | tr '\n' ' ')
+          echo "numbers=$ALL" >> $GITHUB_OUTPUT
+
+      - name: Close issues
+        if: steps.collect.outputs.numbers != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const nums = `${{ steps.collect.outputs.numbers }}`.trim().split(/\s+/).map(n => Number(n)).filter(Boolean);
+
+            for (const num of nums) {
+              try {
+                const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: num });
+                if (issue.state !== 'closed') {
+                  await github.rest.issues.update({
+                    owner, repo, issue_number: num,
+                    state: 'closed',
+                    state_reason: 'completed'
+                  });
+                }
+              } catch (e) {
+                core.warning(`Cannot close #${num}: ${e.message}`);
+              }
+            }
