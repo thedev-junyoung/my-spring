@@ -1,0 +1,26 @@
+language: ko-KR
+reviews:
+  profile: chill
+  review_status: true
+  high_level_summary: true
+  path_filters:
+    - '**/*.java'
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+
+languages:
+  - java
+
+pre_merge_checks:
+  description:
+    mode: error
+  issue_assessment:
+    mode: error
+  custom_checks:
+    - mode: error
+      name: "PR description length"
+      instructions: "Fail if the PR description has fewer than 20 non-whitespace characters."
+    - mode: error
+      name: "Require linked issue"
+      instructions: "Fail if no linked issue is present or no issue key (e.g., ABC-123) appears in the title/description."
