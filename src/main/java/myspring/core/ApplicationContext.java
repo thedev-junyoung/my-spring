@@ -9,7 +9,7 @@ import org.reflections.Reflections;
 import java.lang.reflect.Constructor;
 import java.util.*;
 
-public class ApplicationContext {
+public class ApplicationContext implements AutoCloseable {
 
     // 싱글톤 캐시: SINGLETON 스코프의 인스턴스만 저장
     private final Map<Class<?>, Object> singletons = new HashMap<>();
@@ -19,6 +19,10 @@ public class ApplicationContext {
 
     private final Set<Class<?>> components;
     private final Set<Class<?>> creating = new HashSet<>();
+
+    // 라이프사이클 위임자
+    private final LifecycleProcessor lifecycle = new LifecycleProcessor();
+
 
     private ApplicationContext(String basePackage) {
         // 1) @Component 스캔
@@ -33,7 +37,7 @@ public class ApplicationContext {
             beanDefinitions.put(c, scope);
         }
 
-        // 3) EAGER 초기화는 싱글톤만! (프로토타입은 캐시 금지)
+        // 싱글톤만 eager 생성 + PostConstruct 호출은 lifecycle이 담당
         for (Class<?> c : components) {
             if (beanDefinitions.get(c) == ScopeType.SINGLETON) {
                 getOrCreateSingleton(c);
@@ -85,12 +89,12 @@ public class ApplicationContext {
         return created;
     }
 
-    // 실제 인스턴스 생성(그래프): 생성자 선택 → 파라미터 의존성 해결 → new
+
+
+    // 생성 그래프: 생성자 선택 → 의존성 해결 → new → PostConstruct
     private Object createNewInstanceGraph(Class<?> clazz) {
-        // 순환 의존성 방지
-        if (creating.contains(clazz)) {
+        if (creating.contains(clazz))
             throw new IllegalStateException("Circular dependency detected at: " + clazz.getName());
-        }
         creating.add(clazz);
         try {
             Constructor<?> ctor = selectConstructor(clazz);
@@ -98,7 +102,12 @@ public class ApplicationContext {
                     .map(this::resolveDependency)
                     .toArray();
             ctor.setAccessible(true);
-            return newInstance(ctor, args);
+            Object instance = newInstance(ctor, args);
+
+            // 위임: 생성/주입 완료 직후 초기화 훅 실행
+            lifecycle.invokePostConstruct(instance);
+
+            return instance;
         } finally {
             creating.remove(clazz);
         }
@@ -142,5 +151,10 @@ public class ApplicationContext {
         } catch (Exception e) {
             throw new RuntimeException("Failed to instantiate: " + ctor.getDeclaringClass().getName(), e);
         }
+    }
+
+    @Override
+    public void close() {
+        lifecycle.invokePreDestroyAll(singletons.values());
     }
 }
