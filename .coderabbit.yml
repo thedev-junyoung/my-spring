@@ -8,6 +8,9 @@ reviews:
   auto_review:
     enabled: true
     auto_incremental_review: true
+  poem: false
+  summary: true
+  severity: high
 
 languages:
   - java

@@ -1,4 +1,3 @@
-// src/test/java/myspring/core/ScopeTest.java
 package myspring.core;
 
 import myspring.core.annotation.Component;
