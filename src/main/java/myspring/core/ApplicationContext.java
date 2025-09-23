@@ -2,23 +2,42 @@ package myspring.core;
 
 import myspring.core.annotation.Component;
 import myspring.core.annotation.Inject;
+import myspring.core.annotation.Scope;
+import myspring.core.annotation.ScopeType;
 import org.reflections.Reflections;
 
 import java.lang.reflect.Constructor;
 import java.util.*;
 
 public class ApplicationContext {
-    private final Map<Class<?>, Object> beans = new HashMap<>();
+
+    // 싱글톤 캐시: SINGLETON 스코프의 인스턴스만 저장
+    private final Map<Class<?>, Object> singletons = new HashMap<>();
+
+    // 빈 정의 메타: 컴포넌트 클래스 → 스코프(SINGLETON/PROTOTYPE)
+    private final Map<Class<?>, ScopeType> beanDefinitions = new HashMap<>();
+
     private final Set<Class<?>> components;
-    private final Set<Class<?>> creating = new HashSet<>(); // 순환 감지용
+    private final Set<Class<?>> creating = new HashSet<>();
 
     private ApplicationContext(String basePackage) {
+        // 1) @Component 스캔
         Reflections reflections = new Reflections(basePackage);
         this.components = reflections.getTypesAnnotatedWith(Component.class);
-        System.out.println("Found components: " + components);
-        // 즉시 전부 만들 필요는 없지만, 간단히 전부 만들어두자
+
+        // 2) 스코프 메타 등록 (@Scope 없으면 기본 SINGLETON)
         for (Class<?> c : components) {
-            getOrCreate(c);
+            ScopeType scope = c.isAnnotationPresent(Scope.class)
+                    ? c.getAnnotation(Scope.class).value()
+                    : ScopeType.SINGLETON;
+            beanDefinitions.put(c, scope);
+        }
+
+        // 3) EAGER 초기화는 싱글톤만! (프로토타입은 캐시 금지)
+        for (Class<?> c : components) {
+            if (beanDefinitions.get(c) == ScopeType.SINGLETON) {
+                getOrCreateSingleton(c);
+            }
         }
     }
 
@@ -28,35 +47,47 @@ public class ApplicationContext {
 
     @SuppressWarnings("unchecked")
     public <T> T getBean(Class<T> type) {
-        // 정확 매칭
-        Object bean = beans.get(type);
-        if (bean != null) return (T) bean;
+        // 1) 정확 매칭: 정의에 등록된 클래스면 스코프에 맞게 반환
+        if (beanDefinitions.containsKey(type)) {
+            return (T) getAccordingToScope(type);
+        }
 
-        // 할당 가능 매칭(인터페이스/상위타입)
-        List<Map.Entry<Class<?>, Object>> candidates = beans.entrySet().stream()
-                .filter(e -> type.isAssignableFrom(e.getKey()))
+        // 2) 다형성 매칭: 컴포넌트들 중 assignable 후보 수집
+        List<Class<?>> candidates = components.stream()
+                .filter(type::isAssignableFrom)
                 .toList();
+
         if (candidates.size() == 1) {
-            return (T) candidates.get(0).getValue();
+            return (T) getAccordingToScope(candidates.get(0));
         }
         if (candidates.isEmpty()) {
-            // 아직 안 만들어졌으면 컴포넌트 중에서 타입 맞는 걸 찾아 생성 시도
-            Optional<Class<?>> target = components.stream()
-                    .filter(type::isAssignableFrom)
-                    .findFirst();
-            if (target.isPresent()) {
-                return (T) getOrCreate(target.get());
-            }
+            throw new IllegalArgumentException("No bean of type: " + type.getName());
         }
-        throw new IllegalArgumentException("No unique bean of type: " + type.getName());
+        throw new IllegalArgumentException("No unique bean of type: " + type.getName() + ", candidates=" + candidates);
     }
 
-    // ===== 내부 구현 =====
+    // 스코프에 따른 반환 전략
+    private Object getAccordingToScope(Class<?> clazz) {
+        ScopeType scope = beanDefinitions.getOrDefault(clazz, ScopeType.SINGLETON);
+        return (scope == ScopeType.SINGLETON)
+                ? getOrCreateSingleton(clazz)    // 캐시 사용/생성
+                : createNewInstanceGraph(clazz); // 매번 새로 생성
+    }
 
-    private Object getOrCreate(Class<?> clazz) {
-        Object existing = beans.get(clazz);
+    // ===== 생성 로직 =====
+
+    // 싱글톤 전용: 캐시에 있으면 꺼내고, 없으면 만들어서 캐시에 저장
+    private Object getOrCreateSingleton(Class<?> clazz) {
+        Object existing = singletons.get(clazz);
         if (existing != null) return existing;
+        Object created = createNewInstanceGraph(clazz);
+        singletons.put(clazz, created);
+        return created;
+    }
 
+    // 실제 인스턴스 생성(그래프): 생성자 선택 → 파라미터 의존성 해결 → new
+    private Object createNewInstanceGraph(Class<?> clazz) {
+        // 순환 의존성 방지
         if (creating.contains(clazz)) {
             throw new IllegalStateException("Circular dependency detected at: " + clazz.getName());
         }
@@ -67,14 +98,13 @@ public class ApplicationContext {
                     .map(this::resolveDependency)
                     .toArray();
             ctor.setAccessible(true);
-            Object instance = newInstance(ctor, args);
-            beans.put(clazz, instance);
-            return instance;
+            return newInstance(ctor, args);
         } finally {
             creating.remove(clazz);
         }
     }
 
+    // @Inject 1개 우선, 없으면 기본 생성자
     private Constructor<?> selectConstructor(Class<?> clazz) {
         Constructor<?>[] ctors = clazz.getDeclaredConstructors();
         List<Constructor<?>> injects = Arrays.stream(ctors)
@@ -84,8 +114,6 @@ public class ApplicationContext {
             throw new IllegalStateException("@Inject constructor must be single: " + clazz.getName());
         }
         if (injects.size() == 1) return injects.get(0);
-
-        // @Inject가 없으면 기본 생성자 fallback
         try {
             return clazz.getDeclaredConstructor();
         } catch (NoSuchMethodException e) {
@@ -94,20 +122,18 @@ public class ApplicationContext {
     }
 
     private Object resolveDependency(Class<?> depType) {
-        // 이미 만들어진 빈
-        for (Map.Entry<Class<?>, Object> e : beans.entrySet()) {
-            if (depType.isAssignableFrom(e.getKey())) {
-                return e.getValue();
-            }
-        }
-        // 컴포넌트 중 타입 일치하는 것 찾아 생성
+        // 정의된 컴포넌트 중 타입 매칭
         Optional<Class<?>> target = components.stream()
                 .filter(depType::isAssignableFrom)
                 .findFirst();
-        if (target.isPresent()) {
-            return getOrCreate(target.get());
+        if (target.isEmpty()) {
+            throw new IllegalStateException("Unsatisfied dependency: " + depType.getName());
         }
-        throw new IllegalStateException("Unsatisfied dependency: " + depType.getName());
+        Class<?> targetClass = target.get();
+        ScopeType scope = beanDefinitions.getOrDefault(targetClass, ScopeType.SINGLETON);
+        return (scope == ScopeType.SINGLETON)
+                ? getOrCreateSingleton(targetClass)    // 싱글톤은 캐시
+                : createNewInstanceGraph(targetClass); // 프로토타입은 새로 생성
     }
 
     private static Object newInstance(Constructor<?> ctor, Object[] args) {
