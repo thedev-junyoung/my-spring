@@ -1,35 +1,32 @@
-name: PR title = Issue title (no body change)
+name: PR title = [#issue] issue-title
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
-  contents: write
   pull-requests: write
   issues: read
 
 jobs:
-  apply-issue-title:
+  pr-title:
     runs-on: ubuntu-latest
     steps:
-      - name: Extract issue number from branch name
+      - name: Extract issue number from branch
         id: extract
         run: |
           BRANCH="${{ github.head_ref }}"
-          # 예) feat/123-login, fix/456, chore/789-rename
+          # feat/9-login → 9 추출
           ISSUE=$(echo "$BRANCH" | grep -oE '[0-9]+' | head -1 || true)
           echo "issue=$ISSUE" >> $GITHUB_OUTPUT
-          TYPE=$(echo "$BRANCH" | sed -E 's@/.*@@' | tr '[:upper:]' '[:lower:]')
-          echo "type=$TYPE" >> $GITHUB_OUTPUT
 
       - name: Stop if no issue number
         if: steps.extract.outputs.issue == ''
         run: echo "No issue number in branch. Skipping."
 
-      - name: Fetch issue (title)
+      - name: Fetch issue
         if: steps.extract.outputs.issue != ''
-        id: fetch_issue
+        id: fetch
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -39,38 +36,26 @@ jobs:
             try {
               const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
               core.setOutput('title', issue.title);
-              core.setOutput('number', String(issue.number));
+              core.setOutput('number', issue.number.toString());
             } catch (e) {
               core.warning(`Issue #${issueNumber} not found: ${e.message}`);
             }
 
-      - name: Update PR title only (prefix + issue title + (#n))
-        if: steps.fetch_issue.outputs.title != ''
+      - name: Update PR title only
+        if: steps.fetch.outputs.title != ''
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const issueNumber = "${{ steps.fetch.outputs.number }}";
+            const issueTitle  = "${{ steps.fetch.outputs.title }}";
+            const newTitle = `[#${issueNumber}] ${issueTitle}`;
 
-            const issueNumber = Number("${{ steps.fetch_issue.outputs.number }}");
-            const issueTitle  = `${{ steps.fetch_issue.outputs.title }}`;
-            const type        = "${{ steps.extract.outputs.type }}".toLowerCase();
-
-            // 브랜치 prefix → PR 태그 매핑
-            const map = { feat: 'Feat', fix: 'Fix', chore: 'Chore', refactor: 'Refactor', docs: 'Docs', test: 'Test' };
-            const tag = map[type] || 'Feat';
-
-            // 최종 제목 구성
-            const desired = `[${tag}] ${issueTitle} (#${issueNumber})`;
-
-            // 이미 원하는 제목이면 스킵
-            if ((pr.title || '').trim() === desired.trim()) {
-              core.info('Title already up-to-date.');
-              return;
+            if (pr.title.trim() !== newTitle.trim()) {
+              await github.rest.pulls.update({
+                owner, repo, pull_number: pr.number,
+                title: newTitle
+              });
             }
-
-            await github.rest.pulls.update({
-              owner, repo, pull_number: pr.number,
-              title: desired
-            });
