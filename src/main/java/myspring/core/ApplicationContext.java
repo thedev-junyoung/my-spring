@@ -1,12 +1,10 @@
 package myspring.core;
 
-import myspring.core.annotation.Component;
-import myspring.core.annotation.Inject;
-import myspring.core.annotation.Scope;
-import myspring.core.annotation.ScopeType;
+import myspring.core.annotation.*;
 import org.reflections.Reflections;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.*;
 
 public class ApplicationContext implements AutoCloseable {
@@ -16,6 +14,11 @@ public class ApplicationContext implements AutoCloseable {
 
     // 빈 정의 메타: 컴포넌트 클래스 → 스코프(SINGLETON/PROTOTYPE)
     private final Map<Class<?>, ScopeType> beanDefinitions = new HashMap<>();
+
+
+    // @Bean 메서드 메타: 반환 타입 → (설정 인스턴스, 메서드, 스코프)
+    private static record BeanMethodMeta(Object configInstance, Method method, ScopeType scope) {}
+    private final Map<Class<?>, BeanMethodMeta> beanMethodsByType = new HashMap<>();
 
     private final Set<Class<?>> components;
     private final Set<Class<?>> creating = new HashSet<>();
@@ -29,19 +32,32 @@ public class ApplicationContext implements AutoCloseable {
         Reflections reflections = new Reflections(basePackage);
         this.components = reflections.getTypesAnnotatedWith(Component.class);
 
-        // 2) 스코프 메타 등록 (@Scope 없으면 기본 SINGLETON)
-        for (Class<?> c : components) {
-            ScopeType scope = c.isAnnotationPresent(Scope.class)
-                    ? c.getAnnotation(Scope.class).value()
-                    : ScopeType.SINGLETON;
-            beanDefinitions.put(c, scope);
+        // 2) @Configuration 클래스 처리: 인스턴스 만들고 @Bean 메서드 등록
+        Set<Class<?>> configs = reflections.getTypesAnnotatedWith(Configuration.class);
+        for (Class<?> cfgClass : configs) {
+            Object cfg = getOrCreateAccordingToComponentRules(cfgClass); // DI 지원
+            for (Method m : cfgClass.getDeclaredMethods()) {
+                if (m.isAnnotationPresent(Bean.class)) {
+                    Bean beanAnno = m.getAnnotation(Bean.class);
+                    ScopeType scope = beanAnno.scope();
+                    Class<?> returnType = m.getReturnType();
+                    if (beanMethodsByType.containsKey(returnType)) {
+                        throw new IllegalArgumentException("Duplicate @Bean return type: " + returnType);
+                    }
+                    m.setAccessible(true);
+                    beanMethodsByType.put(returnType, new BeanMethodMeta(cfg, m, scope));
+                    // 타입 기준 조회가 가능하도록 정의에도 등록
+                    beanDefinitions.put(returnType, scope);
+                }
+            }
         }
-
         // 싱글톤만 eager 생성 + PostConstruct 호출은 lifecycle이 담당
         for (Class<?> c : components) {
-            if (beanDefinitions.get(c) == ScopeType.SINGLETON) {
-                getOrCreateSingleton(c);
+            ScopeType scope = ScopeType.SINGLETON;
+            if (c.isAnnotationPresent(Scope.class)) {
+                scope = c.getAnnotation(Scope.class).value();
             }
+            beanDefinitions.put(c, scope);
         }
     }
 
@@ -73,9 +89,12 @@ public class ApplicationContext implements AutoCloseable {
     // 스코프에 따른 반환 전략
     private Object getAccordingToScope(Class<?> clazz) {
         ScopeType scope = beanDefinitions.getOrDefault(clazz, ScopeType.SINGLETON);
-        return (scope == ScopeType.SINGLETON)
-                ? getOrCreateSingleton(clazz)    // 캐시 사용/생성
-                : createNewInstanceGraph(clazz); // 매번 새로 생성
+        if (scope == ScopeType.SINGLETON) {
+            return getOrCreateSingleton(clazz); // SINGLETON은 캐시 사용
+        } else if (scope == ScopeType.PROTOTYPE) {
+            return createNewInstanceGraph(clazz); // PROTOTYPE은 항상 새로 생성
+        }
+        throw new IllegalStateException("Unsupported scope: " + scope);
     }
 
     // ===== 생성 로직 =====
@@ -91,22 +110,40 @@ public class ApplicationContext implements AutoCloseable {
 
 
 
-    // 생성 그래프: 생성자 선택 → 의존성 해결 → new → PostConstruct
+    // 생성 그래프: 컴포넌트 클래스 vs @Bean 메서드 반환 타입을 구분 처리
     private Object createNewInstanceGraph(Class<?> clazz) {
         if (creating.contains(clazz))
             throw new IllegalStateException("Circular dependency detected at: " + clazz.getName());
         creating.add(clazz);
         try {
+            // 1) @Bean 메서드 반환 타입이면 메서드 호출로 생성
+            BeanMethodMeta meta = beanMethodsByType.get(clazz);
+            if (meta != null) {
+                Object[] args = Arrays.stream(meta.method.getParameterTypes())
+                        .map(this::resolveDependency)
+                        .toArray();
+                try {
+                    Object instance = meta.method.invoke(meta.configInstance, args);
+                    if (instance == null) {
+                        throw new IllegalStateException("@Bean method returned null: " +
+                                meta.configInstance.getClass().getName() + "#" + meta.method.getName());
+                    }
+                    lifecycle.invokePostConstruct(instance);
+                    return instance;
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to invoke @Bean: " +
+                            meta.configInstance.getClass().getName() + "#" + meta.method.getName(), e);
+                }
+            }
+
+            // 2) 일반 @Component 클래스면 생성자 주입
             Constructor<?> ctor = selectConstructor(clazz);
             Object[] args = Arrays.stream(ctor.getParameterTypes())
                     .map(this::resolveDependency)
                     .toArray();
             ctor.setAccessible(true);
             Object instance = newInstance(ctor, args);
-
-            // 위임: 생성/주입 완료 직후 초기화 훅 실행
             lifecycle.invokePostConstruct(instance);
-
             return instance;
         } finally {
             creating.remove(clazz);
@@ -131,8 +168,8 @@ public class ApplicationContext implements AutoCloseable {
     }
 
     private Object resolveDependency(Class<?> depType) {
-        // 정의된 컴포넌트 중 타입 매칭
-        Optional<Class<?>> target = components.stream()
+        // 정의된 모든 타입(컴포넌트 + @Bean 반환 타입)에서 탐색
+        Optional<Class<?>> target = beanDefinitions.keySet().stream()
                 .filter(depType::isAssignableFrom)
                 .findFirst();
         if (target.isEmpty()) {
@@ -145,6 +182,13 @@ public class ApplicationContext implements AutoCloseable {
                 : createNewInstanceGraph(targetClass); // 프로토타입은 새로 생성
     }
 
+    // 설정 클래스 자체를 컴포넌트 규칙으로 생성
+    private Object getOrCreateAccordingToComponentRules(Class<?> clazz) {
+        ScopeType scope = beanDefinitions.getOrDefault(clazz, ScopeType.SINGLETON);
+        return (scope == ScopeType.SINGLETON) ? getOrCreateSingleton(clazz)
+                : createNewInstanceGraph(clazz);
+    }
+
     private static Object newInstance(Constructor<?> ctor, Object[] args) {
         try {
             return ctor.newInstance(args);
@@ -152,7 +196,6 @@ public class ApplicationContext implements AutoCloseable {
             throw new RuntimeException("Failed to instantiate: " + ctor.getDeclaringClass().getName(), e);
         }
     }
-
     @Override
     public void close() {
         lifecycle.invokePreDestroyAll(singletons.values());
